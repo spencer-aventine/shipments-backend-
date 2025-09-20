@@ -8,7 +8,7 @@ app.use(express.json({ limit: "10mb" }));
 
 /* ===================== ENV (set these in Render) ===================== */
 const HUBSPOT_TOKEN     = process.env.HUBSPOT_TOKEN;                 // REQUIRED
-const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || "";       // e.g., 47987553
+const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || "47987553";       // e.g., 47987553
 const RM_BASE           = process.env.RM_BASE || "https://api.royalmail.net";
 const RM_CLIENT_ID      = process.env.RM_CLIENT_ID || "";
 const RM_CLIENT_SECRET  = process.env.RM_CLIENT_SECRET || "";
