@@ -5,49 +5,63 @@ import FormData from "form-data";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ====== ENV (you'll set these in Render) ======
-const HUBSPOT_TOKEN     = process.env.HUBSPOT_TOKEN;             // HubSpot project app token (Static Auth)
-const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || "47987553";   // e.g., 47987553
+/* ====== ENV: set these in Render (no hardcoding) ====== */
+const HUBSPOT_TOKEN     = process.env.HUBSPOT_TOKEN;           // <— HS Project App token (Static Auth)
+const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || "47987553"; // <— your portal (pre-set)
 const RM_BASE           = process.env.RM_BASE || "https://api.royalmail.net";
 const RM_CLIENT_ID      = process.env.RM_CLIENT_ID;
 const RM_CLIENT_SECRET  = process.env.RM_CLIENT_SECRET;
 const RM_USERNAME       = process.env.RM_USERNAME;
 const RM_PASSWORD       = process.env.RM_PASSWORD;
-const INBOUND_SECRET    = process.env.INBOUND_SECRET || "";      // optional; used for /tracking/sync protection
+const INBOUND_SECRET    = process.env.INBOUND_SECRET || "";    // optional: protects /tracking/sync
 
-// ====== health ======
+/* ====== OPTIONAL: default sender if not stored per record ====== */
+const SENDER_NAME       = process.env.SENDER_NAME       || "Your Company";
+const SENDER_LINE1      = process.env.SENDER_LINE1      || "1 Example Way";
+const SENDER_CITY       = process.env.SENDER_CITY       || "London";
+const SENDER_POSTCODE   = process.env.SENDER_POSTCODE   || "W1A 1AA";
+const SENDER_COUNTRY    = process.env.SENDER_COUNTRY    || "GB";
+
+/* ====== simple health ====== */
 app.get("/", (_, res) => res.type("text").send("Shipments backend OK"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ====== helper: optional secret check for cron ======
+/* ====== protect cron if you set INBOUND_SECRET ====== */
 function checkSecret(req, res, next) {
-  if (!INBOUND_SECRET) return next();                // no secret configured
+  if (!INBOUND_SECRET) return next();
   const got = req.header("x-inbound-secret");
   if (got === INBOUND_SECRET) return next();
   return res.status(401).json({ ok: false, error: "unauthorized" });
 }
 
-// ====== Create Label (supports GET from your HubSpot card) ======
+/* ====== CREATE LABEL: called by your HubSpot card ====== */
+/* Uses your business rules: Tracked 48 + Letter + 100g */
 app.all("/labels/create", async (req, res) => {
   try {
     const listingId = req.query.listingId || req.body?.listingId;
     if (!listingId) return res.status(400).json({ ok:false, error:"missing listingId" });
 
-    // 1) Read the Shipment (Listings) record from HubSpot
+    // 1) Fetch Shipment (Listings) from HubSpot
     const props = [
-      "shipment_id","order_number","service_type","service_code","package_type",
-      "weight_grams","length_mm","width_mm","height_mm",
+      // core
+      "shipment_id","order_number","shipment_status",
+      // addresses (we’ll default sender in env)
       "sender_name","sender_line1","sender_city","sender_postcode","sender_country_code",
       "recipient_name","recipient_line1","recipient_city","recipient_postcode","recipient_country_code",
-      "label_format","label_size","rmg_shipment_number","tracking_number","label_url"
+      // return + tracking
+      "rmg_shipment_number","tracking_number","label_url"
     ];
     const hsUrl = `https://api.hubapi.com/crm/v3/objects/listings/${listingId}?properties=${props.join(",")}`;
     const hs = await axios.get(hsUrl, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
     const p = hs.data.properties || {};
 
-    // Idempotency: if already has a shipment created, don't create again
+    // Idempotency: if we already created, don't create again
     if (p.rmg_shipment_number) {
-      return res.json({ ok:true, message:"Shipment already created", trackingNumber: p.tracking_number, labelUrl: p.label_url });
+      const recordUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/LISTINGS/${listingId}`;
+      return res
+        .status(200)
+        .send(`<p>Shipment already created. <a href="${recordUrl}" target="_self">Back to Shipment</a></p>
+               <script>window.location="${recordUrl}"</script>`);
     }
 
     // 2) Royal Mail auth
@@ -56,26 +70,37 @@ app.all("/labels/create", async (req, res) => {
     });
     const rmToken = tok.data?.access_token;
 
-    // 3) Create Royal Mail shipment
-    const serviceCode = p.service_code || mapServiceType(p.service_type);
-    const body = {
-      serviceCode,
+    // 3) Create RM shipment — fixed service & weight by your rules
+    const createBody = {
+      serviceCode: "TR48",                                      // Always Tracked 48
       shipmentDate: new Date().toISOString().slice(0,10),
       sender: {
-        name: p.sender_name,
-        address: { addressLine1: p.sender_line1, postcode: p.sender_postcode, countryCode: p.sender_country_code || "GB" }
+        name: p.sender_name || SENDER_NAME,
+        address: {
+          addressLine1: p.sender_line1 || SENDER_LINE1,
+          postcode: p.sender_postcode || SENDER_POSTCODE,
+          countryCode: p.sender_country_code || SENDER_COUNTRY
+        }
       },
       recipient: {
         name: p.recipient_name,
-        address: { addressLine1: p.recipient_line1, postcode: p.recipient_postcode, countryCode: p.recipient_country_code || "GB" }
+        address: {
+          addressLine1: p.recipient_line1,
+          postcode: p.recipient_postcode,
+          countryCode: p.recipient_country_code || "GB"
+        }
       },
       package: {
-        weightInGrams: Number(p.weight_grams) || 0,
-        dimensions: { lengthMM:+p.length_mm||0, widthMM:+p.width_mm||0, heightMM:+p.height_mm||0 }
+        // Always Letter, 100g (dimensions not required for letters)
+        weightInGrams: 100,
+        dimensions: { lengthMM: 0, widthMM: 0, heightMM: 0 }
       },
-      references: { customerReference: p.order_number || p.shipment_id || listingId }
+      references: {
+        customerReference: p.order_number || p.shipment_id || listingId
+      }
     };
-    const created = await axios.post(`${RM_BASE}/shipping/v2/domestic`, body, {
+
+    const created = await axios.post(`${RM_BASE}/shipping/v2/domestic`, createBody, {
       headers: { Authorization: `Bearer ${rmToken}`, "Content-Type": "application/json" }
     });
     const shipmentNumber = created.data?.shipmentNumber;
@@ -88,10 +113,10 @@ app.all("/labels/create", async (req, res) => {
     const labelBuffer = Buffer.from(label.data);
     const filename = `${p.order_number || p.shipment_id || shipmentNumber}.pdf`;
 
-    // 5) Upload the label to HubSpot Files (public URL, not indexed)
+    // 5) Upload to HubSpot Files (public, non-indexed)
     const labelUrl = await uploadToHubSpotFiles(labelBuffer, filename, "application/pdf");
 
-    // 6) Patch the Shipment with results
+    // 6) Patch Shipment back in HubSpot
     await axios.patch(`https://api.hubapi.com/crm/v3/objects/listings/${listingId}`, {
       properties: {
         rmg_shipment_number: shipmentNumber,
@@ -102,15 +127,12 @@ app.all("/labels/create", async (req, res) => {
       }
     }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
 
-    // Nice UX: redirect back to the Shipment in HubSpot if user opened this in a tab
-    const recordUrl = HUBSPOT_PORTAL_ID
-      ? `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/LISTINGS/${listingId}`
-      : "";
-    return res.status(200).send(
-      recordUrl
-        ? `<p>Label created. <a href="${recordUrl}" target="_self">Return to Shipment</a></p><script>window.location="${recordUrl}"</script>`
-        : { ok: true, shipmentNumber, trackingNumber, labelUrl }
-    );
+    // Redirect back to the Shipment record for a smooth UX
+    const recordUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/LISTINGS/${listingId}`;
+    return res
+      .status(200)
+      .send(`<p>Label created. <a href="${recordUrl}" target="_self">Return to Shipment</a></p>
+             <script>window.location="${recordUrl}"</script>`);
 
   } catch (e) {
     console.error("[/labels/create] error:", e?.response?.data || e.message);
@@ -118,12 +140,13 @@ app.all("/labels/create", async (req, res) => {
   }
 });
 
-// ====== Tracking sync (cron calls this) ======
+/* ====== TRACKING SYNC: called by GitHub Actions on a schedule ====== */
 app.post("/tracking/sync", checkSecret, async (_req, res) => {
   try {
     const searchBody = {
       filterGroups: [{ filters: [{ propertyName: "shipment_status", operator: "NOT_IN", values: ["Delivered","Cancelled"] }]}],
-      properties: ["tracking_number","shipment_status"], limit: 100
+      properties: ["tracking_number","shipment_status"],
+      limit: 100
     };
     const { data } = await axios.post("https://api.hubapi.com/crm/v3/objects/listings/search", searchBody, {
       headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
@@ -136,7 +159,8 @@ app.post("/tracking/sync", checkSecret, async (_req, res) => {
       const tracking = rec.properties?.tracking_number;
       if (!tracking) continue;
 
-      const t = await rmGetTracking(tracking); // TODO: implement using RM Tracking API
+      // TODO: implement with RM Tracking API
+      const t = await rmGetTracking(tracking);
       if (!t) continue;
 
       const update = mapTrackingToProperties(t);
@@ -147,17 +171,15 @@ app.post("/tracking/sync", checkSecret, async (_req, res) => {
         updated++;
       }
     }
-    return res.json({ ok: true, scanned: results.length, updated });
 
+    return res.json({ ok: true, scanned: results.length, updated });
   } catch (e) {
     console.error("[/tracking/sync] error:", e?.response?.data || e.message);
     return res.status(500).json({ ok:false, error: e?.response?.data || e.message });
   }
 });
 
-// ====== helpers ======
-function mapServiceType(t) { return ({ "Tracked 24":"TR24", "Tracked 48":"TR48" }[t] || t); }
-
+/* ====== Helpers ====== */
 async function uploadToHubSpotFiles(buffer, filename, contentType) {
   const form = new FormData();
   form.append("file", buffer, { filename, contentType });
@@ -169,9 +191,22 @@ async function uploadToHubSpotFiles(buffer, filename, contentType) {
   return data?.url || data?.full_url || "";
 }
 
-// TODO: replace with Royal Mail Tracking API call; return something like:
-// { status: "In Transit", lastEvent: { code, description, location, time }, eta: "YYYY-MM-DD" }
-async function rmGetTracking(trackingNumber) { return null; }
+// TODO: wire to RM Tracking API; return { status, lastEvent:{ code, description, location, time }, eta }
+async function rmGetTracking(_trackingNumber) { return null; }
+
+function mapTrackingToProperties(t) {
+  const out = {};
+  if (t.status) out.shipment_status = t.status;
+  if (t.lastEvent) {
+    out.last_event_code = t.lastEvent.code;
+    out.last_event_description = t.lastEvent.description;
+    out.last_event_location = t.lastEvent.location;
+    out.last_event_time = t.lastEvent.time; // ISO 8601
+  }
+  if (t.eta) out.expected_delivery_date = t.eta;
+  if (t.status === "Delivered" && t.lastEvent?.time) out.delivered_datetime = t.lastEvent.time;
+  return out;
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Shipments backend listening on :${PORT}`));
