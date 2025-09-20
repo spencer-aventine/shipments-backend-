@@ -36,68 +36,98 @@ function checkSecret(req, res, next) {
 
 /* ====== CREATE LABEL: called by your HubSpot card ====== */
 /* Uses your business rules: Tracked 48 + Letter + 100g */
-app.all("/labels/create", async (req, res) => {
+// Create label from a Contact: builds a Shipment, creates RM label, updates both
+app.all("/labels/create-from-contact", async (req, res) => {
   try {
-    const listingId = req.query.listingId || req.body?.listingId;
-    if (!listingId) return res.status(400).json({ ok:false, error:"missing listingId" });
+    const contactId = req.query.contactId || req.body?.contactId;
+    if (!contactId) return res.status(400).json({ ok:false, error:"missing contactId" });
 
-    // 1) Fetch Shipment (Listings) from HubSpot
-    const props = [
-      // core
-      "shipment_id","order_number","shipment_status",
-      // addresses (we’ll default sender in env)
-      "sender_name","sender_line1","sender_city","sender_postcode","sender_country_code",
-      "recipient_name","recipient_line1","recipient_city","recipient_postcode","recipient_country_code",
-      // return + tracking
-      "rmg_shipment_number","tracking_number","label_url"
-    ];
-    const hsUrl = `https://api.hubapi.com/crm/v3/objects/listings/${listingId}?properties=${props.join(",")}`;
-    const hs = await axios.get(hsUrl, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
-    const p = hs.data.properties || {};
+    // 1) Read contact fields (adjust if your contact stores different field names)
+    const c = await axios.get(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}?properties=firstname,lastname,address,city,zip,country,abc_create_label_now,abc_label_created,abc_tracking_number,abc_shipment_status`,
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
+    const cp = c.data.properties || {};
+    const recipient = {
+      name: `${cp.firstname || ""} ${cp.lastname || ""}`.trim() || "Recipient",
+      line1: cp.address,
+      city: cp.city,
+      postcode: cp.zip,
+      country: (cp.country || "GB").toUpperCase()
+    };
 
-    // Idempotency: if we already created, don't create again
-    if (p.rmg_shipment_number) {
-      const recordUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/LISTINGS/${listingId}`;
-      return res
-        .status(200)
-        .send(`<p>Shipment already created. <a href="${recordUrl}" target="_self">Back to Shipment</a></p>
-               <script>window.location="${recordUrl}"</script>`);
+    // Early validation
+    if (!recipient.line1 || !recipient.postcode) {
+      return res.status(400).send("Contact is missing address line1 or postcode.");
     }
 
-    // 2) Royal Mail auth
+    // 2) Mark "clicked" + clear/create fields on Contact (so Workflows can trigger)
+    await axios.patch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+      { properties: { abc_create_label_now: "true" } },
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
+
+    // 3) Create the Shipment (Listings) record
+    const shipmentProps = {
+      shipment_id: `CT-${contactId}-${Date.now()}`,
+      order_number: `CT-${contactId}`,
+      // Sender defaults come from env or record-level if you added them
+      sender_name: process.env.SENDER_NAME || "Your Company",
+      sender_line1: process.env.SENDER_LINE1 || "1 Example Way",
+      sender_city: process.env.SENDER_CITY || "London",
+      sender_postcode: process.env.SENDER_POSTCODE || "W1A 1AA",
+      sender_country_code: process.env.SENDER_COUNTRY || "GB",
+      // Recipient from contact
+      recipient_name: recipient.name,
+      recipient_line1: recipient.line1,
+      recipient_city: recipient.city,
+      recipient_postcode: recipient.postcode,
+      recipient_country_code: recipient.country,
+      // Initial status
+      shipment_status: "Created"
+    };
+    const ls = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/listings",
+      { properties: shipmentProps },
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
+    const listingId = ls.data.id;
+
+    // 4) Associate Shipment ⇄ Contact
+    await axios.post(
+      "https://api.hubapi.com/crm/v4/associations/listings/contacts/batch/create",
+      { inputs: [{ from: { id: listingId }, to: { id: contactId }, type: "listing_to_contact" }] },
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
+
+    // 5) Create RM shipment (Tracked 48, Letter, 100g) and label
     const tok = await axios.post(`${RM_BASE}/shipping/v2/token`, {
       client_id: RM_CLIENT_ID, client_secret: RM_CLIENT_SECRET, username: RM_USERNAME, password: RM_PASSWORD
     });
     const rmToken = tok.data?.access_token;
 
-    // 3) Create RM shipment — fixed service & weight by your rules
     const createBody = {
-      serviceCode: "TR48",                                      // Always Tracked 48
+      serviceCode: "TR48",
       shipmentDate: new Date().toISOString().slice(0,10),
       sender: {
-        name: p.sender_name || SENDER_NAME,
+        name: process.env.SENDER_NAME || "Your Company",
         address: {
-          addressLine1: p.sender_line1 || SENDER_LINE1,
-          postcode: p.sender_postcode || SENDER_POSTCODE,
-          countryCode: p.sender_country_code || SENDER_COUNTRY
+          addressLine1: process.env.SENDER_LINE1 || "1 Example Way",
+          postcode: process.env.SENDER_POSTCODE || "W1A 1AA",
+          countryCode: process.env.SENDER_COUNTRY || "GB"
         }
       },
       recipient: {
-        name: p.recipient_name,
+        name: recipient.name,
         address: {
-          addressLine1: p.recipient_line1,
-          postcode: p.recipient_postcode,
-          countryCode: p.recipient_country_code || "GB"
+          addressLine1: recipient.line1,
+          postcode: recipient.postcode,
+          countryCode: recipient.country
         }
       },
-      package: {
-        // Always Letter, 100g (dimensions not required for letters)
-        weightInGrams: 100,
-        dimensions: { lengthMM: 0, widthMM: 0, heightMM: 0 }
-      },
-      references: {
-        customerReference: p.order_number || p.shipment_id || listingId
-      }
+      package: { weightInGrams: 100, dimensions: { lengthMM: 0, widthMM: 0, heightMM: 0 } },
+      references: { customerReference: `CT-${contactId}` }
     };
 
     const created = await axios.post(`${RM_BASE}/shipping/v2/domestic`, createBody, {
@@ -106,75 +136,44 @@ app.all("/labels/create", async (req, res) => {
     const shipmentNumber = created.data?.shipmentNumber;
     const trackingNumber = created.data?.trackingNumber;
 
-    // 4) Generate label (PDF)
     const label = await axios.put(`${RM_BASE}/shipping/v2/${shipmentNumber}/label`, null, {
       headers: { Authorization: `Bearer ${rmToken}` }, responseType: "arraybuffer"
     });
-    const labelBuffer = Buffer.from(label.data);
-    const filename = `${p.order_number || p.shipment_id || shipmentNumber}.pdf`;
+    const labelUrl = await uploadToHubSpotFiles(Buffer.from(label.data), `CT-${contactId}.pdf`, "application/pdf");
 
-    // 5) Upload to HubSpot Files (public, non-indexed)
-    const labelUrl = await uploadToHubSpotFiles(labelBuffer, filename, "application/pdf");
+    // 6) Patch the Shipment + Contact
+    await axios.patch(
+      `https://api.hubapi.com/crm/v3/objects/listings/${listingId}`,
+      { properties: {
+          rmg_shipment_number: shipmentNumber,
+          tracking_number: trackingNumber,
+          tracking_url: `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`,
+          label_url: labelUrl,
+          shipment_status: "Label Printed"
+      }},
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
 
-    // 6) Patch Shipment back in HubSpot
-    await axios.patch(`https://api.hubapi.com/crm/v3/objects/listings/${listingId}`, {
-      properties: {
-        rmg_shipment_number: shipmentNumber,
-        tracking_number: trackingNumber,
-        tracking_url: `https://www.royalmail.com/track-your-item#/tracking-results/${trackingNumber}`,
-        label_url: labelUrl,
-        shipment_status: "Label Printed"
-      }
-    }, { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }});
+    await axios.patch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+      { properties: {
+          abc_label_created: "true",
+          abc_label_created_at: new Date().toISOString(),
+          abc_tracking_number: trackingNumber,
+          abc_shipment_status: "Label Printed"
+      }},
+      { headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` } }
+    );
 
-    // Redirect back to the Shipment record for a smooth UX
-    const recordUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/LISTINGS/${listingId}`;
+    // 7) Redirect back to the Contact (or the Shipment if you prefer)
+    const contactUrl = `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/0-1/${contactId}`;
     return res
       .status(200)
-      .send(`<p>Label created. <a href="${recordUrl}" target="_self">Return to Shipment</a></p>
-             <script>window.location="${recordUrl}"</script>`);
+      .send(`<p>Label created. <a href="${contactUrl}" target="_self">Back to Contact</a></p>
+             <script>window.location="${contactUrl}"</script>`);
 
   } catch (e) {
-    console.error("[/labels/create] error:", e?.response?.data || e.message);
-    return res.status(500).json({ ok:false, error: e?.response?.data || e.message });
-  }
-});
-
-/* ====== TRACKING SYNC: called by GitHub Actions on a schedule ====== */
-app.post("/tracking/sync", checkSecret, async (_req, res) => {
-  try {
-    const searchBody = {
-      filterGroups: [{ filters: [{ propertyName: "shipment_status", operator: "NOT_IN", values: ["Delivered","Cancelled"] }]}],
-      properties: ["tracking_number","shipment_status"],
-      limit: 100
-    };
-    const { data } = await axios.post("https://api.hubapi.com/crm/v3/objects/listings/search", searchBody, {
-      headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
-    });
-    const results = data?.results || [];
-    let updated = 0;
-
-    for (const rec of results) {
-      const id = rec.id;
-      const tracking = rec.properties?.tracking_number;
-      if (!tracking) continue;
-
-      // TODO: implement with RM Tracking API
-      const t = await rmGetTracking(tracking);
-      if (!t) continue;
-
-      const update = mapTrackingToProperties(t);
-      if (Object.keys(update).length) {
-        await axios.patch(`https://api.hubapi.com/crm/v3/objects/listings/${id}`, { properties: update }, {
-          headers: { Authorization: `Bearer ${HUBSPOT_TOKEN}` }
-        });
-        updated++;
-      }
-    }
-
-    return res.json({ ok: true, scanned: results.length, updated });
-  } catch (e) {
-    console.error("[/tracking/sync] error:", e?.response?.data || e.message);
+    console.error("[/labels/create-from-contact] error:", e?.response?.data || e.message);
     return res.status(500).json({ ok:false, error: e?.response?.data || e.message });
   }
 });
